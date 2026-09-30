@@ -1,0 +1,13 @@
+{
+  "name": "tanchishe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "贪吃蛇游戏。实际的 Next.js 应用位于 my-app 子目录，这里的脚本会自动转进去执行。",
+  "scripts": {
+    "dev": "cd my-app && npm run dev",
+    "build": "cd my-app && npm run build",
+    "start": "cd my-app && npm run start",
+    "lint": "cd my-app && npm run lint",
+    "install:app": "cd my-app && npm install"
+  }
+}
