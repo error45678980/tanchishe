@@ -366,6 +366,11 @@ export default function SnakeGame() {
     };
   }, [handleGameOver]);
 
+  // 打开页面时记录一次访问（写进 visit_log 表）
+  useEffect(() => {
+    fetch("/api/visit", { method: "POST" }).catch(() => {});
+  }, []);
+
   // 首次进入页面就拉一次排行榜。
   // 所有 setState 都放在 Promise 回调里，effect 体内不做同步状态更新。
   useEffect(() => {
