@@ -23,4 +23,12 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  /* 手机上玩到一半被「下拉刷新」拽走会很崩溃，这里收住边缘回弹 */
+  overscroll-behavior-y: contain;
+}
+
+/* 去掉安卓点击时的蓝色高亮方块，触屏操作更干净 */
+button,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
 }

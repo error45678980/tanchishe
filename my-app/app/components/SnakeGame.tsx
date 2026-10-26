@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 import { LEADERBOARD_LIMIT, NAME_MAX_LENGTH } from "@/lib/constants";
 import type { PlayerScore } from "@/lib/types";
@@ -22,6 +29,10 @@ const MIN_STEP_MS = 65; // 速度上限
 const SPEED_UP_EVERY = 5; // 每吃 5 个食物提速一档
 const SPEED_UP_MS = 8; // 每档提速的毫秒数
 
+const BOOST_FACTOR = 0.58; // 按住加速时步长缩到 58%（约 1.7 倍速）
+const MIN_BOOST_STEP_MS = 42; // 加速下的步长下限，防止快到不可控
+const SWIPE_MIN_DISTANCE = 24; // 触屏滑动至少这么多像素才判定为转向
+
 const DIRECTIONS: Record<Direction, Point> = {
   up: { x: 0, y: -1 },
   down: { x: 0, y: 1 },
@@ -40,6 +51,35 @@ const KEY_TO_DIRECTION: Record<string, Direction> = {
   d: "right",
 };
 
+/**
+ * 焦点是否落在可输入的元素里。
+ * 是的话，键盘属于输入框和输入法，游戏一个键都不许抢。
+ */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+/**
+ * 清理名字：去掉粘贴常带进来的零宽字符和控制字符，
+ * 免得排行榜上出现一条"看得见却读不出"的空名字。
+ */
+function sanitizeName(value: string): string {
+  let cleaned = "";
+
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    const isControl = code < 0x20 || code === 0x7f;
+    if (isControl || char === "\u200B" || char === "\uFEFF") continue;
+    cleaned += char;
+  }
+
+  return cleaned.trim();
+}
+
 /* ------------------------------- 游戏状态 ------------------------------- */
 
 type GameState = {
@@ -52,6 +92,8 @@ type GameState = {
   stepMs: number;
   elapsedMs: number;
   status: Status;
+  /** 是否正按住加速（Shift / 加速按钮） */
+  boosting: boolean;
 };
 
 function samePoint(a: Point, b: Point) {
@@ -91,7 +133,14 @@ function createGame(): GameState {
     stepMs: START_STEP_MS,
     elapsedMs: 0,
     status: "idle",
+    boosting: false,
   };
+}
+
+/** 当前实际生效的步长：按住加速时按比例缩短，但不低于下限。 */
+function effectiveStepMs(game: GameState) {
+  if (!game.boosting) return game.stepMs;
+  return Math.max(MIN_BOOST_STEP_MS, Math.round(game.stepMs * BOOST_FACTOR));
 }
 
 /** 把方向按键放进待生效队列，顺带过滤掉 180° 掉头和重复方向。 */
@@ -220,7 +269,17 @@ function drawBoard(ctx: CanvasRenderingContext2D, game: GameState) {
 
   // 蛇身
   game.snake.forEach((segment, index) => {
-    ctx.fillStyle = index === 0 ? "#86efac" : "#22c55e";
+    const isHead = index === 0;
+    const glowing = isHead && game.boosting;
+
+    ctx.fillStyle = isHead ? "#86efac" : "#22c55e";
+    if (glowing) {
+      // 加速时给蛇头套一层翠绿辉光，视觉上能立刻感知到「正在飙车」
+      ctx.save();
+      ctx.shadowColor = "rgba(52, 211, 153, 0.9)";
+      ctx.shadowBlur = 16;
+    }
+
     traceRoundRect(
       ctx,
       segment.x * CELL + 1.5,
@@ -230,6 +289,8 @@ function drawBoard(ctx: CanvasRenderingContext2D, game: GameState) {
       5,
     );
     ctx.fill();
+
+    if (glowing) ctx.restore();
   });
 
   // 蛇眼睛（画在垂直于前进方向的两侧）
@@ -276,6 +337,34 @@ async function fetchLeaderboard(): Promise<PlayerScore[]> {
   return Array.isArray(data?.scores) ? data.scores : [];
 }
 
+/* ------------------------------ 触屏方向键 ------------------------------ */
+
+/** 手机端十字方向键的一格。按下即转向，不需要点击事件，手感更跟手。 */
+function PadButton({
+  label,
+  ariaLabel,
+  onPress,
+}: {
+  label: string;
+  ariaLabel: string;
+  onPress: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      onPointerDown={(event) => {
+        event.preventDefault(); // 别让长按选中文字 / 双击缩放
+        onPress();
+      }}
+      onContextMenu={(event) => event.preventDefault()}
+      className="flex h-14 w-14 touch-none select-none items-center justify-center rounded-lg bg-zinc-200/70 text-xl font-semibold text-zinc-700 transition-colors active:bg-emerald-500 active:text-white dark:bg-white/5 dark:text-zinc-100 dark:active:bg-emerald-500"
+    >
+      {label}
+    </button>
+  );
+}
+
 /* ------------------------------- React 组件 ------------------------------- */
 
 export default function SnakeGame() {
@@ -285,9 +374,16 @@ export default function SnakeGame() {
   const playerNameRef = useRef("");
   /** 游戏循环里调用不到最新的 React 回调，用 ref 转发一层 */
   const finishRef = useRef<(finalScore: number) => void>(() => {});
+  /** 界面已经显示过的分数，用来判断游戏内分数是否变了（每帧最多同步一次） */
+  const syncedScoreRef = useRef(0);
+  /** 触屏滑动的起点 */
+  const swipeStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+  /** 输入法是否正在组字（拼音还没上屏），组字期间回车只是选词，不该开局 */
+  const composingRef = useRef(false);
 
   const [status, setStatus] = useState<Status>("idle");
   const [score, setScore] = useState(0);
+  const [boosting, setBoosting] = useState(false);
   const [playerName, setPlayerName] = useState("");
   const [nameInput, setNameInput] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
@@ -330,8 +426,13 @@ export default function SnakeGame() {
   /** 游戏结束：先把成绩写进数据库，再刷新排行榜 */
   const handleGameOver = useCallback(
     async (finalScore: number) => {
+      const game = gameRef.current;
+      if (game) game.boosting = false;
+      syncedScoreRef.current = finalScore;
+
       setStatus("over");
       setScore(finalScore);
+      setBoosting(false);
       setSaving(true);
       setSaveError(null);
 
@@ -365,6 +466,70 @@ export default function SnakeGame() {
       void handleGameOver(finalScore);
     };
   }, [handleGameOver]);
+
+  /** 开 / 关加速。只有游戏进行中才允许开启，避免暂停或结束时留下「幽灵油门」。 */
+  const setBoost = useCallback((on: boolean) => {
+    const game = gameRef.current;
+    if (!game) return;
+
+    game.boosting = game.status === "running" ? on : false;
+    setBoosting(game.boosting);
+  }, []);
+
+  /** 加速按钮：按下即踩油门，抬手 / 取消 / 失去指针捕获都松油门 */
+  const handleBoostPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault(); // 别让按钮抢走焦点，否则空格会误触暂停
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setBoost(true);
+  };
+
+  const handleBoostPointerUp = () => {
+    setBoost(false);
+  };
+
+  /** 触屏滑动转向：记录起点，抬手时按主轴方向判定 */
+  const handleBoardPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (gameRef.current?.status !== "running") return;
+    swipeStartRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      pointerId: event.pointerId,
+    };
+  };
+
+  const handleBoardPointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const start = swipeStartRef.current;
+    swipeStartRef.current = null;
+
+    const game = gameRef.current;
+    if (!start || !game || start.pointerId !== event.pointerId) return;
+
+    const dx = event.clientX - start.x;
+    const dy = event.clientY - start.y;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < SWIPE_MIN_DISTANCE) return;
+
+    const direction: Direction =
+      Math.abs(dx) > Math.abs(dy)
+        ? dx > 0
+          ? "right"
+          : "left"
+        : dy > 0
+          ? "down"
+          : "up";
+
+    enqueueDirection(game, direction);
+  };
+
+  const handleBoardPointerCancel = () => {
+    swipeStartRef.current = null;
+  };
+
+  /** 手机方向键：按下即转向 */
+  const handlePadPress = (direction: Direction) => {
+    const game = gameRef.current;
+    if (!game) return;
+    enqueueDirection(game, direction);
+  };
 
   // 打开页面时记录一次访问（写进 visit_log 表）
   useEffect(() => {
@@ -416,14 +581,21 @@ export default function SnakeGame() {
 
       if (game.status === "running") {
         game.elapsedMs += delta;
-        while (game.elapsedMs >= game.stepMs) {
-          game.elapsedMs -= game.stepMs;
+        // 每一轮都重新算步长：加速按下 / 松开的瞬间就能生效
+        while (game.elapsedMs >= effectiveStepMs(game)) {
+          game.elapsedMs -= effectiveStepMs(game);
           if (!stepGame(game)) {
             game.status = "over";
             game.elapsedMs = 0;
             finishRef.current(game.score);
             break;
           }
+        }
+
+        // 分数一变就同步给界面；每帧最多一次 setState，不会逐帧刷新
+        if (game.score !== syncedScoreRef.current) {
+          syncedScoreRef.current = game.score;
+          setScore(game.score);
         }
       }
 
@@ -441,19 +613,36 @@ export default function SnakeGame() {
       const game = gameRef.current;
       if (!game) return;
 
+      // 输入法正在组字，或者焦点在输入框里：这些键全部归输入框。
+      // 少了这两行，a / s / d / w 会被当成方向键吞掉，
+      // 空格更狠——它是中文输入法选字上屏的键，被吞了中文就打不出来。
+      if (event.isComposing || event.keyCode === 229) return;
+      if (isTypingTarget(event.target)) return;
+
+      // Shift：按住加速，松开恢复
+      if (event.key === "Shift") {
+        if (!event.repeat) setBoost(true);
+        return;
+      }
+
       const direction =
         KEY_TO_DIRECTION[event.key] ?? KEY_TO_DIRECTION[event.key.toLowerCase()];
 
+      // 只有游戏真正在跑时才接管方向键；空闲 / 暂停 / 结束时把键盘还给页面
       if (direction) {
+        if (game.status !== "running") return;
         event.preventDefault(); // 别让方向键滚动页面
         enqueueDirection(game, direction);
         return;
       }
 
       if (event.key === " " || event.key === "Spacebar") {
+        if (game.status !== "running" && game.status !== "paused") return;
         event.preventDefault(); // 别让空格滚动页面
         if (game.status === "running") {
           game.status = "paused";
+          game.boosting = false;
+          setBoosting(false);
           setStatus("paused");
         } else if (game.status === "paused") {
           game.status = "running";
@@ -462,9 +651,25 @@ export default function SnakeGame() {
       }
     };
 
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Shift") setBoost(false);
+    };
+
+    // 切窗口 / 切标签页时 keyup 可能收不到，兜底松开油门
+    const releaseBoost = () => setBoost(false);
+
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", releaseBoost);
+    document.addEventListener("visibilitychange", releaseBoost);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", releaseBoost);
+      document.removeEventListener("visibilitychange", releaseBoost);
+    };
+  }, [setBoost]);
 
   /** 开一局新游戏（必须原地修改对象，游戏循环才看得到新状态） */
   const resetGame = useCallback((nameToUse: string) => {
@@ -475,8 +680,10 @@ export default function SnakeGame() {
     game.status = "running";
 
     playerNameRef.current = nameToUse;
+    syncedScoreRef.current = 0;
     setPlayerName(nameToUse);
     setScore(0);
+    setBoosting(false);
     setSaveError(null);
     setStatus("running");
   }, []);
@@ -484,7 +691,10 @@ export default function SnakeGame() {
   const handleStart = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
-    const trimmed = nameInput.trim();
+    // 输入法还在组字（拼音没上屏）时按回车只是选词，别急着开局
+    if (composingRef.current) return;
+
+    const trimmed = sanitizeName(nameInput);
     if (trimmed === "") {
       setFormError("请先输入你的名字");
       return;
@@ -495,6 +705,7 @@ export default function SnakeGame() {
     }
 
     setFormError(null);
+    setNameInput(trimmed);
     resetGame(trimmed);
   };
 
@@ -504,6 +715,8 @@ export default function SnakeGame() {
 
     if (game.status === "running") {
       game.status = "paused";
+      game.boosting = false;
+      setBoosting(false);
       setStatus("paused");
     } else if (game.status === "paused") {
       game.status = "running";
@@ -517,8 +730,10 @@ export default function SnakeGame() {
     if (game) {
       Object.assign(game, createGame());
     }
+    syncedScoreRef.current = 0;
     setStatus("idle");
     setScore(0);
+    setBoosting(false);
     setSaveError(null);
     setNameInput(playerName || nameInput);
   };
@@ -529,22 +744,35 @@ export default function SnakeGame() {
     <section className="flex w-full flex-col items-center gap-6 lg:flex-row lg:items-start lg:justify-center">
       <div className="flex w-full max-w-[420px] flex-col gap-3">
         {/* 顶部信息条 */}
-        <div className="flex items-center justify-between rounded-xl bg-zinc-900 px-4 py-2 text-sm text-zinc-100">
+        <div className="flex items-center justify-between gap-3 rounded-xl bg-zinc-900 px-3 py-2 text-xs text-zinc-100 sm:px-4 sm:text-sm">
           <span className="truncate">
             玩家：<span className="font-medium">{playerName || "—"}</span>
           </span>
-          <span className="font-mono text-lg font-semibold text-emerald-400">
-            {score} 分
+          <span className="flex shrink-0 items-center gap-1.5">
+            {boosting && (
+              <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
+                ⚡ 加速中
+              </span>
+            )}
+            <span className="font-mono text-lg font-semibold tabular-nums text-emerald-400 sm:text-xl">
+              {score} 分
+            </span>
           </span>
         </div>
 
-        {/* 棋盘 */}
-        <div className="relative overflow-hidden rounded-xl ring-1 ring-black/10 dark:ring-white/15">
+        {/* 棋盘：宽度同时受容器、420px 和视口高度约束，横屏手机也不会撑出屏幕 */}
+        <div
+          className="relative mx-auto w-full touch-none select-none overflow-hidden rounded-xl ring-1 ring-black/10 dark:ring-white/15"
+          style={{ maxWidth: "min(100%, 420px, 68dvh)" }}
+        >
           <canvas
             ref={canvasRef}
             width={BOARD_WIDTH}
             height={BOARD_HEIGHT}
-            className="block h-auto w-full"
+            onPointerDown={handleBoardPointerDown}
+            onPointerUp={handleBoardPointerUp}
+            onPointerCancel={handleBoardPointerCancel}
+            className="block h-auto w-full touch-none"
           />
 
           {overlayVisible && (
@@ -558,15 +786,27 @@ export default function SnakeGame() {
                     输入名字，开始游戏
                   </h2>
                   <input
+                    id="player-name"
+                    name="playerName"
                     value={nameInput}
                     onChange={(event) => {
                       setNameInput(event.target.value);
                       setFormError(null);
                     }}
+                    onCompositionStart={() => {
+                      composingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      composingRef.current = false;
+                    }}
                     maxLength={NAME_MAX_LENGTH}
                     placeholder="你的名字"
+                    autoComplete="off"
+                    spellCheck={false}
+                    enterKeyHint="go"
+                    aria-label="你的名字"
                     autoFocus
-                    className="w-full rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-center text-white placeholder:text-white/40 focus:border-emerald-400 focus:outline-none"
+                    className="w-full select-text rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-center text-white placeholder:text-white/40 focus:border-emerald-400 focus:outline-none"
                   />
                   {formError && <p className="text-xs text-rose-300">{formError}</p>}
                   <button
@@ -644,8 +884,69 @@ export default function SnakeGame() {
           )}
         </div>
 
+        {/* 手机触屏控制区：十字方向键 + 大号加速键（桌面端用键盘，隐藏） */}
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-black/10 bg-white/80 p-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] dark:border-white/10 dark:bg-zinc-900/70 lg:hidden">
+          <div className="grid grid-cols-3 grid-rows-3 gap-1.5">
+            <span aria-hidden />
+            <PadButton label="↑" ariaLabel="向上" onPress={() => handlePadPress("up")} />
+            <span aria-hidden />
+            <PadButton label="←" ariaLabel="向左" onPress={() => handlePadPress("left")} />
+            <button
+              type="button"
+              onClick={handlePauseToggle}
+              className="flex h-14 w-14 touch-manipulation select-none items-center justify-center rounded-lg bg-zinc-200/70 text-xs font-medium text-zinc-600 transition-colors active:bg-zinc-300 dark:bg-white/5 dark:text-zinc-300 dark:active:bg-white/15"
+            >
+              {status === "paused" ? "继续" : "暂停"}
+            </button>
+            <PadButton label="→" ariaLabel="向右" onPress={() => handlePadPress("right")} />
+            <span aria-hidden />
+            <PadButton label="↓" ariaLabel="向下" onPress={() => handlePadPress("down")} />
+            <span aria-hidden />
+          </div>
+
+          <button
+            type="button"
+            aria-label="按住加速"
+            onPointerDown={handleBoostPointerDown}
+            onPointerUp={handleBoostPointerUp}
+            onPointerCancel={handleBoostPointerUp}
+            onLostPointerCapture={handleBoostPointerUp}
+            onContextMenu={(event) => event.preventDefault()}
+            className={`flex h-20 w-20 shrink-0 touch-none select-none flex-col items-center justify-center rounded-full text-xs font-semibold transition-all ${
+              boosting
+                ? "scale-95 bg-emerald-500 text-white ring-4 ring-emerald-500/30"
+                : "bg-emerald-500/15 text-emerald-700 ring-1 ring-emerald-500/30 dark:text-emerald-300"
+            }`}
+          >
+            <span className="text-lg leading-none">⚡</span>
+            <span className="mt-0.5">按住加速</span>
+          </button>
+        </div>
+
+        {/* 桌面端加速按钮：鼠标党也能用，顺便当功能提示 */}
+        <div className="hidden justify-center lg:flex">
+          <button
+            type="button"
+            onPointerDown={handleBoostPointerDown}
+            onPointerUp={handleBoostPointerUp}
+            onPointerCancel={handleBoostPointerUp}
+            onLostPointerCapture={handleBoostPointerUp}
+            onContextMenu={(event) => event.preventDefault()}
+            className={`select-none rounded-full px-4 py-1.5 text-xs font-medium transition-all ${
+              boosting
+                ? "bg-emerald-500 text-white ring-2 ring-emerald-500/40"
+                : "bg-emerald-500/10 text-emerald-700 ring-1 ring-emerald-500/30 hover:bg-emerald-500/20 dark:text-emerald-300"
+            }`}
+          >
+            ⚡ 按住加速（Shift）
+          </button>
+        </div>
+
         <p className="text-center text-xs text-zinc-500 dark:text-zinc-400">
-          方向键 / WASD 控制方向，空格暂停或继续
+          <span className="lg:hidden">滑动棋盘或按方向键移动 · 按住 ⚡ 加速</span>
+          <span className="hidden lg:inline">
+            方向键 / WASD 移动 · 按住 Shift 加速 · 空格暂停
+          </span>
         </p>
       </div>
 
