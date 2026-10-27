@@ -13,7 +13,7 @@
 #   用户   admin（pm2 守护进程也跑在 admin 名下）
 #   进程   pm2 应用名 tanchishe，fork 单实例，端口 3000
 #   自启   systemd 的 pm2-admin.service
-#   入口   nginx 80 → 127.0.0.1:3000
+#   入口   Cloudflare Tunnel → 127.0.0.1:3000（不监听 80，防未备案检测）
 # ---------------------------------------------------------------
 set -euo pipefail
 
@@ -122,8 +122,8 @@ if [ "$MODE" = "update" ]; then
 else
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq curl git ca-certificates nginx >/dev/null
-  ok "curl / git / nginx 就绪"
+  apt-get install -y -qq curl git ca-certificates >/dev/null
+  ok "curl / git 就绪"
 
   NEED_NODE=1
   if command -v node >/dev/null 2>&1; then
@@ -269,62 +269,31 @@ else
 fi
 
 # =====================================================================
-# 7. Nginx 反向代理
+# 7. 关闭 nginx（对外入口改为 Cloudflare Tunnel）
 # =====================================================================
-STEP="Nginx"
-log "7/7 Nginx 反向代理（80 → 3000）"
+STEP="关闭 nginx"
+log "7/7 关闭 nginx（对外入口走 Cloudflare Tunnel，不监听 80）"
 
-if grep -q "proxy_read_timeout" /etc/nginx/sites-available/tanchishe 2>/dev/null; then
-  ok "配置已包含 WebSocket 超时设置，跳过"
+if systemctl is-active nginx >/dev/null 2>&1; then
+  systemctl stop nginx
+  systemctl disable nginx >/dev/null 2>&1 || true
+  ok "nginx 已停止并禁用（80 端口不再对外）"
 else
-  cp /etc/nginx/sites-available/tanchishe "/etc/nginx/sites-available/tanchishe.bak.$(date +%s)" 2>/dev/null || true
-  cat > /etc/nginx/sites-available/tanchishe <<'NGINX'
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-
-        # 联机走 WebSocket，必须转发 Upgrade 头，否则房间能建、朋友进不来
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-
-        # nginx 默认 60 秒无数据就断，大厅里等朋友进来会莫名掉线
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-NGINX
-  ln -sf /etc/nginx/sites-available/tanchishe /etc/nginx/sites-enabled/tanchishe
-  ok "已写入新配置"
+  systemctl disable nginx >/dev/null 2>&1 || true
+  ok "nginx 未运行，无需处理"
 fi
 
-if nginx -t >/dev/null 2>&1; then
-  systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl reload nginx
-  ok "nginx 配置生效"
-else
-  nginx -t
-  die "nginx 配置有问题，上面是详细报错"
-fi
+info "访问入口只有 Cloudflare Tunnel，查看当前地址："
+info "sudo journalctl -u cloudflared-tunnel -n 50 --no-pager | grep trycloudflare"
 
 # =====================================================================
 # 完成
 # =====================================================================
-PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<你的公网IP>')"
-
 printf '\n\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\033[1;32m  部署完成 🐍\033[0m\n'
 printf '\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n\n'
-printf '  游戏地址   \033[4mhttp://%s\033[0m\n' "$PUBLIC_IP"
-printf '  联机大厅   \033[4mhttp://%s/room\033[0m\n\n' "$PUBLIC_IP"
+printf '  游戏地址   通过 Cloudflare Tunnel 访问（不暴露服务器 IP）\n'
+printf '  隧道地址   sudo journalctl -u cloudflared-tunnel -n 50 --no-pager | grep trycloudflare\n\n'
 printf '  日常运维：\n'
 printf '    su - %s -c "pm2 logs %s"        看日志\n' "$APP_USER" "$APP_NAME"
 printf '    su - %s -c "pm2 restart %s"     重启（会清空进行中的房间）\n' "$APP_USER" "$APP_NAME"
