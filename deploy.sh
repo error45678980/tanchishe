@@ -149,6 +149,11 @@ if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" fetch --all --prune -q
   git -C "$APP_DIR" reset --hard origin/main -q
   ok "已同步到最新：$(git -C "$APP_DIR" log --oneline -1)"
+elif [ -d "$APP_DIR/my-app" ]; then
+  # 用 tar + scp 上传的代码没有 .git，直接就地部署
+  ok "检测到已上传的代码目录（非 git 仓库），跳过拉取"
+elif [ -d "$APP_DIR" ]; then
+  die "$APP_DIR 存在但不是有效代码目录（既没 .git 也没 my-app/），先清理再重试"
 else
   mkdir -p "$(dirname "$APP_DIR")"
   info "克隆 $REPO_URL"
