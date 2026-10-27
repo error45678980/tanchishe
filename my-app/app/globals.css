@@ -32,3 +32,46 @@ button,
 [role="button"] {
   -webkit-tap-highlight-color: transparent;
 }
+
+/* 联机倒计时：数字每秒弹一下，比干巴巴地换数字有仪式感 */
+@keyframes countdown-pop {
+  0% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+  45% {
+    transform: scale(0.94);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.countdown-pop {
+  animation: countdown-pop 0.45s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+/* 棋盘左上角的死亡播报 */
+@keyframes feed-in {
+  from {
+    transform: translateY(-6px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.feed-in {
+  animation: feed-in 0.24s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .countdown-pop,
+  .feed-in {
+    animation: none;
+  }
+}

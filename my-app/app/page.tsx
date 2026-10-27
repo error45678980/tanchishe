@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import SnakeGame from "./components/SnakeGame";
 
 export default function Home() {
@@ -11,6 +13,13 @@ export default function Home() {
           开局前先填名字，每局成绩都会保存到 PostgreSQL 数据库
         </p>
       </header>
+
+      <Link
+        href="/room"
+        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-1.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-500/20 sm:text-sm dark:text-emerald-300"
+      >
+        👥 和朋友联机 · 同一张地图对战
+      </Link>
 
       <SnakeGame />
     </main>

@@ -1,0 +1,10 @@
+# 服务器上跑的脚本必须是 LF，否则 bash 会报 $'\r': command not found
+*.sh text eol=lf
+deploy.sh text eol=lf
+
+# 其余文本文件统一在仓库里存 LF，检出到 Windows 时由 git 自行处理
+*.md text
+*.ts text
+*.tsx text
+*.js text
+*.json text

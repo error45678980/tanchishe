@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // 联机的服务端代码是 Node 的 CJS 文件（require / module.exports），
+    // 用 React 那套规则去检查只会得到一堆误报。
+    "server.js",
+    "server/**",
   ]),
 ]);
 
