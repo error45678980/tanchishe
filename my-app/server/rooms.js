@@ -37,6 +37,7 @@ const ERROR_MESSAGES = {
   NOT_ENOUGH_PLAYERS: "至少需要 2 个人才能开始",
   RATE_LIMITED: "操作太快了，缓一缓",
   SERVER_FULL: "服务器房间已满，稍后再试",
+  TOO_MANY_ROOMS: "你建的房间有点多，先用已有的房间吧",
   INTERNAL: "服务器开了个小差，请重试",
 };
 
@@ -81,11 +82,52 @@ function normalizeCode(value) {
 }
 
 function getIp(req) {
+  // nginx 自己写的头优先：X-Forwarded-For 是客户端可以随便填的
+  const real = req.headers["x-real-ip"];
+  if (typeof real === "string" && real.trim().length > 0 && real.length <= 45) {
+    return real.trim();
+  }
+
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string" && forwarded.length > 0) {
-    return forwarded.split(",")[0].trim();
+    const first = forwarded.split(",")[0].trim();
+    if (first.length > 0 && first.length <= 45) return first;
   }
   return req.socket?.remoteAddress ?? "unknown";
+}
+
+/**
+ * 只接受同源连接。
+ *
+ * 浏览器不会让别的站点读我们的 WebSocket 响应，但会允许它「连上来」——
+ * 也就是 CSWSH。既然客户端永远和页面同源，那就直接比主机名。
+ * 只比主机名不比端口：nginx 传下来的 Host 常常不带端口，比端口会误伤自己。
+ * 没有 Origin 的（curl / 脚本）放行，限流另有安排。
+ */
+function isAllowedOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin || typeof origin !== "string") return true;
+
+  let originHost;
+  try {
+    originHost = new URL(origin).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+
+  const rawHost = String(req.headers.host || req.headers["x-forwarded-host"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+
+  if (!rawHost) return true;
+
+  // 去掉端口（IPv6 字面量形如 [::1]:3000）
+  const hostOnly = rawHost.startsWith("[")
+    ? rawHost.slice(0, rawHost.indexOf("]") + 1)
+    : rawHost.split(":")[0];
+
+  return originHost === hostOnly;
 }
 
 /* ------------------------------- Hub ------------------------------- */
@@ -97,6 +139,12 @@ function createHub({ wss }) {
   const sessions = new Set();
   /** @type {Map<string, number>} IP → 连接数 */
   const ipCounts = new Map();
+  /** @type {Map<string, number[]>} IP → 最近几次建房的时间戳 */
+  const roomCreations = new Map();
+
+  /** 单个 IP 十分钟内最多建几个房。防的是「脚本无限建房把服务器塞满」。 */
+  const ROOM_CREATE_WINDOW_MS = 10 * 60_000;
+  const ROOM_CREATE_LIMIT = 5;
 
   let loopTimer = null;
   let sweepTimer = null;
@@ -114,6 +162,23 @@ function createHub({ wss }) {
       if (!rooms.has(code)) return code;
     }
     throw new Error("房间码生成失败：可能房间太多了");
+  }
+
+  /** 建房频率闸门。返回 false 表示这个 IP 建得太勤了。 */
+  function allowRoomCreation(ip) {
+    const now = Date.now();
+    const recent = (roomCreations.get(ip) ?? []).filter(
+      (at) => now - at < ROOM_CREATE_WINDOW_MS,
+    );
+
+    if (recent.length >= ROOM_CREATE_LIMIT) {
+      roomCreations.set(ip, recent);
+      return false;
+    }
+
+    recent.push(now);
+    roomCreations.set(ip, recent);
+    return true;
   }
 
   function createRoom() {
@@ -507,6 +572,10 @@ function createHub({ wss }) {
         sendError(session.ws, "SERVER_FULL");
         return;
       }
+      if (!allowRoomCreation(session.ip)) {
+        sendError(session.ws, "TOO_MANY_ROOMS");
+        return;
+      }
 
       const room = createRoom();
       rooms.set(room.code, room);
@@ -665,7 +734,13 @@ function createHub({ wss }) {
       case "ping":
         send(session.ws, {
           type: "pong",
-          t: message.t,
+          // 只回显数字或短字符串：别让人拿这个字段当放大器
+          t:
+            typeof message.t === "number"
+              ? message.t
+              : typeof message.t === "string"
+                ? message.t.slice(0, 32)
+                : null,
           serverTime: Date.now(),
         });
         break;
@@ -707,6 +782,16 @@ function createHub({ wss }) {
   /* ---------------------------- 连接接入 ---------------------------- */
 
   wss.on("connection", (ws, req) => {
+    // 来源对不上就直接请走，连 session 都不建
+    if (!isAllowedOrigin(req)) {
+      try {
+        ws.close(4003, "bad origin");
+      } catch {
+        /* 已经断了 */
+      }
+      return;
+    }
+
     const ip = getIp(req);
     const current = ipCounts.get(ip) ?? 0;
 
@@ -776,6 +861,13 @@ function createHub({ wss }) {
       ) {
         rooms.delete(code);
       }
+    }
+
+    // 建房记录也要回收，否则 Map 会随着 IP 数量一直长
+    for (const [ip, stamps] of roomCreations) {
+      const recent = stamps.filter((at) => now - at < ROOM_CREATE_WINDOW_MS);
+      if (recent.length === 0) roomCreations.delete(ip);
+      else roomCreations.set(ip, recent);
     }
   }, TIMING.sweepIntervalMs);
 

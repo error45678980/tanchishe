@@ -337,6 +337,31 @@ async function fetchLeaderboard(): Promise<PlayerScore[]> {
   return Array.isArray(data?.scores) ? data.scores : [];
 }
 
+/** 开局时领到的成绩票据，结算时原样带回服务端验签。 */
+type RunTicket = { runId: string; token: string };
+
+/**
+ * 领一张成绩票据。
+ *
+ * 拿不到就返回 null——这局照样能玩，只是成绩不会入库。
+ * 宁可丢一条记录，也不接受一张没校验过的分数。
+ */
+async function requestRunTicket(): Promise<RunTicket | null> {
+  try {
+    const response = await fetch("/api/runs", { method: "POST", cache: "no-store" });
+    if (!response.ok) return null;
+
+    const data = (await response.json().catch(() => null)) as
+      | { runId?: string; token?: string }
+      | null;
+
+    if (!data?.runId || !data?.token) return null;
+    return { runId: data.runId, token: data.token };
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------ 触屏方向键 ------------------------------ */
 
 /** 手机端十字方向键的一格。按下即转向，不需要点击事件，手感更跟手。 */
@@ -380,6 +405,10 @@ export default function SnakeGame() {
   const swipeStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
   /** 输入法是否正在组字（拼音还没上屏），组字期间回车只是选词，不该开局 */
   const composingRef = useRef(false);
+  /** 本局成绩票据的请求（开局时发起，结算时 await） */
+  const runTicketRef = useRef<Promise<RunTicket | null> | null>(null);
+  /** 本局真正在跑的毫秒数（暂停、切后台都不算），提交时给服务端做合理性校验 */
+  const activeMsRef = useRef(0);
 
   const [status, setStatus] = useState<Status>("idle");
   const [score, setScore] = useState(0);
@@ -436,15 +465,35 @@ export default function SnakeGame() {
       setSaving(true);
       setSaveError(null);
 
+      // 开局时就发起的票据请求，正常情况这里已经到货，几乎不用等
+      const ticket = await (runTicketRef.current ?? Promise.resolve(null));
+      if (!ticket) {
+        setSaveError("没能拿到校验票据，成绩未入库");
+        setSaving(false);
+        return;
+      }
+
       try {
         const response = await fetch("/api/scores", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: playerNameRef.current, score: finalScore }),
+          body: JSON.stringify({
+            name: playerNameRef.current,
+            score: finalScore,
+            runId: ticket.runId,
+            token: ticket.token,
+            durationMs: Math.round(activeMsRef.current),
+          }),
         });
         const data = (await response.json().catch(() => null)) as
-          | { error?: string }
+          | { error?: string; code?: string }
           | null;
+
+        // 409 = 这局已经写进库了（多半是上次响应丢了），当成保存成功
+        if (response.status === 409) {
+          await loadLeaderboard();
+          return;
+        }
 
         if (!response.ok) {
           throw new Error(data?.error ?? `保存失败（HTTP ${response.status}）`);
@@ -581,6 +630,7 @@ export default function SnakeGame() {
 
       if (game.status === "running") {
         game.elapsedMs += delta;
+        activeMsRef.current += delta; // 有效游玩时长，暂停/切后台不计
         // 每一轮都重新算步长：加速按下 / 松开的瞬间就能生效
         while (game.elapsedMs >= effectiveStepMs(game)) {
           game.elapsedMs -= effectiveStepMs(game);
@@ -681,6 +731,9 @@ export default function SnakeGame() {
 
     playerNameRef.current = nameToUse;
     syncedScoreRef.current = 0;
+    activeMsRef.current = 0;
+    // 开局就把票据领了：结算时票已经在手上，不用临时等网络
+    runTicketRef.current = requestRunTicket();
     setPlayerName(nameToUse);
     setScore(0);
     setBoosting(false);
@@ -731,6 +784,8 @@ export default function SnakeGame() {
       Object.assign(game, createGame());
     }
     syncedScoreRef.current = 0;
+    activeMsRef.current = 0;
+    runTicketRef.current = null; // 这一局作废，票也别留着
     setStatus("idle");
     setScore(0);
     setBoosting(false);

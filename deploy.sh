@@ -188,6 +188,7 @@ ENV_FILE="$APP_ROOT/.env.local"
 if [ -f "$ENV_FILE" ]; then
   ok ".env.local 已存在（$(grep -c '=' "$ENV_FILE" || true) 行配置）"
   grep -q '^DATABASE_URL=' "$ENV_FILE" || warn ".env.local 里没找到 DATABASE_URL，排行榜可能会 500"
+  grep -q '^SCORE_SIGNING_SECRET=' "$ENV_FILE" || warn ".env.local 里没找到 SCORE_SIGNING_SECRET，成绩票据会退回用 DATABASE_URL 派生（能用，但不推荐）"
 else
   cat <<EOF
 
