@@ -2,6 +2,9 @@
 *.sh text eol=lf
 deploy.sh text eol=lf
 
+# Windows 批处理必须是 CRLF，LF 会让 cmd 的 goto 循环失效
+*.bat text eol=crlf
+
 # 其余文本文件统一在仓库里存 LF，检出到 Windows 时由 git 自行处理
 *.md text
 *.ts text

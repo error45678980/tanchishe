@@ -34,6 +34,14 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# 数据库备份（含用户数据，绝不入库）
+/backups/
+
+# 运维脚本：含服务器地址与凭据，只留本机
+/scripts/*.py
+/scripts/*.log
+/scripts/listener-result.txt
+
 # vercel
 .vercel
 
